@@ -31,6 +31,17 @@
 (define (log-debug fmt #!rest r #!key (p (current-output-port)))
   (%log p (string-append "DEBUG: " fmt) r))
 
+(define CACHE-DIR-TOP (normalize-pathname "~/.cache"))
+(define CACHE-DIR-SUB
+  (normalize-pathname (string-append CACHE-DIR-TOP "/" "photosort")))
+
+;; Create a location for the SQLite DB
+(define (ensure-cache-dir)
+  (when (not (directory-exists? CACHE-DIR-TOP))
+    (create-directory CACHE-DIR-TOP))
+  (when (not (directory-exists? CACHE-DIR-SUB))
+    (create-directory CACHE-DIR-SUB)))
+
 ;; Ensure we have the correct directories setup
 (define (ensure-dir path date)
   (let* ((year (car date))
@@ -67,6 +78,18 @@
     (log-debug "sha1: ~A" sha)
     (log-debug "copied-path: ~A bytes: ~A" target-path bytes-copied)))
 
+;; Pulls EXIF data from image and if present attempts to copy to a
+;; directory tree in the target-dir shaped like:
+;;
+;; <YEAR>
+;; └── <MONTH>
+;;     └── <FILENAME>
+;;     └── ...
+;;
+;; Then insert into the SQLite table keye on SHA1 hash.
+;;
+;; If the file can't be copied send a message to stderr.
+;;
 (define (process-image path out)
   (let ((tags (tag-alist-from-file path '(model make date-time))))
     (if tags
@@ -76,13 +99,14 @@
                (filename (pathname-strip-directory path))
                (target-path (normalize-pathname
                              (string-append dir "/" filename)))
+               (exif-tags tags)
                (bytes-copied (copy-image path target-path)))
 
           (if bytes-copied
               (create-entry
                (zip-alist
-                '(info path target-path filename bytes-copied)
-                `(,info ,path ,target-path ,filename ,bytes-copied)))
+                '(info path target-path filename bytes-copied exif-tags)
+                `(,info ,path ,target-path ,filename ,bytes-copied ,exif-tags)))
               (log-err "couldn't copy ~A" filename)))
         (log-err "no exif for ~A" path))
     #t))
@@ -104,8 +128,11 @@
         #t
         #f)))
 
-;; (find-files DIRECTORY #!key test action seed limit dotfiles follow-symlinks) 
-
+;; Accepts two command line args:
+;;
+;; input-dir - directory to scan for files
+;; output-dir - directory to copy new file structure to
+;;
 (define (main args)
   (define-values
       (input-dir output-dir)
