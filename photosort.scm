@@ -1,6 +1,7 @@
 (import (chicken format)
         (chicken condition)
         (chicken pathname)
+        (chicken platform)
         (chicken process-context)
         (chicken file)
         list-utils
@@ -8,6 +9,7 @@
         srfi-14
         exif
         image-dimensions
+        sql-de-lite
         simple-sha1)
 
 ;; 1. pull filenames from Camera Uploads dir
@@ -31,9 +33,29 @@
 (define (log-debug fmt #!rest r #!key (p (current-output-port)))
   (%log p (string-append "DEBUG: " fmt) r))
 
-(define CACHE-DIR-TOP (normalize-pathname "~/.cache"))
+(define CACHE-DIR-TOP (system-cache-directory))
 (define CACHE-DIR-SUB
   (normalize-pathname (string-append CACHE-DIR-TOP "/" "photosort")))
+(define CACHE-DB
+  (normalize-pathname (string-append CACHE-DIR-SUB "/" "photos.db")))
+
+(define CREATE-TABLE-PHOTOS #<<SQL
+  CREATE TABLE IF NOT EXISTS photos
+  (hash TEXT NOT NULL UNIQUE,
+        filename TEXT NOT NULL,
+        original_path TEXT NOT NULL,
+        new_path TEXT NOT NULL,
+        filesize INTEGER NOT NULL,
+        width INTEGER,
+        height INTEGER,
+        type TEXT,
+        make TEXT,
+        model TEXT,
+        datetime TEXT NOT NULL)
+SQL
+)
+
+;;  2021:02:13 16:18:41
 
 ;; Create a location for the SQLite DB
 (define (ensure-cache-dir)
@@ -41,6 +63,11 @@
     (create-directory CACHE-DIR-TOP))
   (when (not (directory-exists? CACHE-DIR-SUB))
     (create-directory CACHE-DIR-SUB)))
+
+(define (ensure-db)
+  (let* ((db (open-database CACHE-DB))
+         (stmt (prepare db CREATE-TABLE-PHOTOS)))
+    (step stmt)))
 
 ;; Ensure we have the correct directories setup
 (define (ensure-dir path date)
@@ -57,6 +84,12 @@
 ;; Convert "YYYY:MM:DD HH:MM:SS" to '("YYYY" "MM" "DD")
 (define (datetime->list dt)
   (string-tokenize (car (string-tokenize dt)) char-set:digit))
+
+;; Convert "YYYY:MM:DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS.000"
+(define (datetime->iso8601 dt)
+  (let* ((tokens (string-tokenize dt))
+         (date (string-tokenize (car tokens) char-set:digit)))
+    (string-append (string-join date "-") " " (cadr tokens) ".000")))
 
 ;; Wraps copy-file with an exception handler to cover an already
 ;; existing file (we don't clobber)
@@ -141,9 +174,12 @@
        (cadr (command-line-arguments))))
   (if (and (directory-exists? input-dir)
            (directory-exists? output-dir))
-      (find-files input-dir
-                  #:test is-jpeg?
-                  #:action (process-dir input-dir output-dir))
+      (begin
+        (ensure-cache-dir)
+        (ensure-db)
+        (find-files input-dir
+                    #:test is-jpeg?
+                    #:action (process-dir input-dir output-dir)))
       (log-err "input: ~A output: ~A" input-dir output-dir)))
 
 
