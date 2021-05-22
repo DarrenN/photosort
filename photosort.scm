@@ -33,9 +33,9 @@
 (define (log-debug fmt #!rest r #!key (p (current-output-port)))
   (%log p (string-append "DEBUG: " fmt) r))
 
-(define CACHE-DIR-TOP (system-cache-directory))
-(define CACHE-DIR-SUB
-  (normalize-pathname (string-append CACHE-DIR-TOP "/" "photosort")))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; SQLite
+
 (define CACHE-DB
   (normalize-pathname (string-append CACHE-DIR-SUB "/" "photos.db")))
 
@@ -55,7 +55,17 @@
 SQL
 )
 
-;;  2021:02:13 16:18:41
+(define (ensure-db)
+  (let* ((db (open-database CACHE-DB))
+         (stmt (prepare db CREATE-TABLE-PHOTOS)))
+    (step stmt)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Filesystem Operations
+
+(define CACHE-DIR-TOP (system-cache-directory))
+(define CACHE-DIR-SUB
+  (normalize-pathname (string-append CACHE-DIR-TOP "/" "photosort")))
 
 ;; Create a location for the SQLite DB
 (define (ensure-cache-dir)
@@ -63,11 +73,6 @@ SQL
     (create-directory CACHE-DIR-TOP))
   (when (not (directory-exists? CACHE-DIR-SUB))
     (create-directory CACHE-DIR-SUB)))
-
-(define (ensure-db)
-  (let* ((db (open-database CACHE-DB))
-         (stmt (prepare db CREATE-TABLE-PHOTOS)))
-    (step stmt)))
 
 ;; Ensure we have the correct directories setup
 (define (ensure-dir path date)
@@ -81,15 +86,22 @@ SQL
       (create-directory month-dir))
     month-dir))
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Datetime utils
+
 ;; Convert "YYYY:MM:DD HH:MM:SS" to '("YYYY" "MM" "DD")
 (define (datetime->list dt)
   (string-tokenize (car (string-tokenize dt)) char-set:digit))
 
+;; 2021:02:13 16:18:41
 ;; Convert "YYYY:MM:DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS.000"
 (define (datetime->iso8601 dt)
   (let* ((tokens (string-tokenize dt))
          (date (string-tokenize (car tokens) char-set:digit)))
     (string-append (string-join date "-") " " (cadr tokens) ".000")))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Image file handling
 
 ;; Wraps copy-file with an exception handler to cover an already
 ;; existing file (we don't clobber)
