@@ -238,8 +238,8 @@ new_path = ? WHERE hash = ?;")
 
           (if bytes-copied              
               (create-entry db opts)
-              (log-err "couldn't copy ~A" filename))))
-        (log-err "no exif for ~A" path))
+              (log-err "couldn't copy ~A" filename)))
+        (log-err "no exif for ~A" path)))
     #t)
 
 (define ((process-dir db in out) path prev)
