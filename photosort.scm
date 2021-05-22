@@ -1,16 +1,17 @@
-(import (chicken format)
-        (chicken condition)
+(import (chicken condition)
+        (chicken file)
+        (chicken format)
         (chicken pathname)
         (chicken platform)
         (chicken process-context)
-        (chicken file)
-        list-utils
-        srfi-13
-        srfi-14
         exif
         image-dimensions
+        list-utils
+        simple-sha1
         sql-de-lite
-        simple-sha1)
+        srfi-13
+        srfi-14
+        srfi-69)
 
 ;; 1. pull filenames from Camera Uploads dir
 ;; 2. use simple-sha1, exif and image-dimensions to get the sha1sum,
@@ -21,6 +22,9 @@
 ;; 6. Copy file into TARGET/<year>/<month> as is
 ;; 7. Add row in sqlite DB with: sha, filename, new path, datetime,
 ;;    width, height, type
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Logging
 
 (define (%log p fmt r)
   (let ((out (if (port? p) p (current-error-port))))
@@ -34,10 +38,16 @@
   (%log p (string-append "DEBUG: " fmt) r))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; SQLite
+;; Cache filepaths
 
+(define CACHE-DIR-TOP (system-cache-directory))
+(define CACHE-DIR-SUB
+  (normalize-pathname (string-append CACHE-DIR-TOP "/" "photosort")))
 (define CACHE-DB
   (normalize-pathname (string-append CACHE-DIR-SUB "/" "photos.db")))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; SQLite
 
 (define CREATE-TABLE-PHOTOS #<<SQL
   CREATE TABLE IF NOT EXISTS photos
@@ -63,10 +73,6 @@ SQL
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Filesystem Operations
 
-(define CACHE-DIR-TOP (system-cache-directory))
-(define CACHE-DIR-SUB
-  (normalize-pathname (string-append CACHE-DIR-TOP "/" "photosort")))
-
 ;; Create a location for the SQLite DB
 (define (ensure-cache-dir)
   (when (not (directory-exists? CACHE-DIR-TOP))
@@ -74,16 +80,27 @@ SQL
   (when (not (directory-exists? CACHE-DIR-SUB))
     (create-directory CACHE-DIR-SUB)))
 
+(define dircache (make-hash-table))
+
+;; Instead of checking directory-exists? for every image store
+;; directory paths in a lookup table. Caches on the next check
+;; after a directory is created.
+(define (cached-create-directory path)
+  (let ((dir? (hash-table-ref/default dircache path #f)))
+    (when (not dir?)
+      (if (directory-exists? path)
+          (hash-table-set! dircache path #t)
+          (create-directory path)))
+    path))
+
 ;; Ensure we have the correct directories setup
 (define (ensure-dir path date)
   (let* ((year (car date))
          (month (cadr date))
          (year-dir (normalize-pathname (string-append path "/" year)))
          (month-dir (normalize-pathname (string-append year-dir "/" month))))
-    (when (not (directory-exists? year-dir))
-      (create-directory year-dir))
-    (when (not (directory-exists? month-dir))
-      (create-directory month-dir))
+    (cached-create-directory year-dir)
+    (cached-create-directory month-dir)
     month-dir))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -91,7 +108,9 @@ SQL
 
 ;; Convert "YYYY:MM:DD HH:MM:SS" to '("YYYY" "MM" "DD")
 (define (datetime->list dt)
-  (string-tokenize (car (string-tokenize dt)) char-set:digit))
+  (if (not dt)
+      (datetime->list "1970:01:01 00:00:00")
+      (string-tokenize (car (string-tokenize dt)) char-set:digit)))
 
 ;; 2021:02:13 16:18:41
 ;; Convert "YYYY:MM:DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS.000"
