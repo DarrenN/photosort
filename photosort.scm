@@ -9,6 +9,7 @@
         list-utils
         simple-sha1
         sql-de-lite
+        srfi-1
         srfi-13
         srfi-14
         srfi-69)
@@ -70,6 +71,37 @@ SQL
          (stmt (prepare db CREATE-TABLE-PHOTOS)))
     (step stmt)))
 
+(define (get-db-handle)
+  (open-database CACHE-DB))
+
+(define (guard-false v)
+  (if (equal? v #f) "" v))
+
+(define (insert-photo db row)
+  ;; '(info path target-path filename bytes-copied exif-tags)
+  ;; (png 10 20 0) type w h rot
+  (let* ((tags (hash-table-ref row 'exif-tags))
+         (make (guard-false (cdr (assq 'make tags))))
+         (model (guard-false (cdr (assq 'model tags))))
+         (datetime (cdr (assq 'date-time tags)))
+         (filename (hash-table-ref row 'filename))
+         (info (hash-table-ref row 'info)))
+
+    (exec (sql db "INSERT OR IGNORE INTO photos(hash, filename,
+original_path, new_path, filesize, width, height, type, make, model,
+datetime) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")
+          (hash-table-ref row 'hash)
+          filename
+          (hash-table-ref row 'path)
+          (hash-table-ref row 'target-path)
+          (hash-table-ref/default row 'bytes-copied 0)
+          (cadr info)
+          (caddr info)
+          (symbol->string (car info))
+          make
+          model
+          (get-iso8601-datetime filename datetime))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Filesystem Operations
 
@@ -106,11 +138,28 @@ SQL
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Datetime utils
 
+(define (get-datetime filename dt)
+  (if dt
+      (datetime->list dt)
+      (datetime->list filename)))
+
 ;; Convert "YYYY:MM:DD HH:MM:SS" to '("YYYY" "MM" "DD")
 (define (datetime->list dt)
   (if (not dt)
       (datetime->list "1970:01:01 00:00:00")
       (string-tokenize (car (string-tokenize dt)) char-set:digit)))
+
+(define (get-iso8601-datetime filename dt)
+  (if (not dt)
+      (filename->iso8601 filename)
+      (datetime->iso8601 dt)))
+
+;; Convert "YYYY-MM-DD HH.MM.SS-x-x.jpg" to "YYYY-MM-DD HH:MM:SS.000"
+(define (filename->iso8601 filename)
+  (let* ((tokens (string-tokenize filename))
+         (date (string-tokenize (car tokens) char-set:digit))
+         (time (take (string-tokenize (cadr tokens) char-set:digit) 3)))
+    (string-append (string-join date "-") " " (string-join time ":") ".000")))
 
 ;; 2021:02:13 16:18:41
 ;; Convert "YYYY:MM:DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS.000"
@@ -132,15 +181,10 @@ SQL
     (copy-file path target-path)))
 
 ;; Get a SHA1 hash of the copied file and insert metadata into DB
-(define (create-entry opts)
-  (let* ((target-path (alist-ref 'target-path opts))
-         (bytes-copied (alist-ref 'bytes-copied opts))
-         (info (alist-ref 'info opts))
-         (path (alist-ref 'path opts))
-         (filename (alist-ref 'filename opts))
-         (sha (sha1sum target-path)))
-    (log-debug "sha1: ~A" sha)
-    (log-debug "copied-path: ~A bytes: ~A" target-path bytes-copied)))
+(define (create-entry db opts)
+  (let ((sha (sha1sum (hash-table-ref opts 'target-path))))
+    (hash-table-set! opts 'hash sha)
+    (insert-photo db opts)))
 
 ;; Pulls EXIF data from image and if present attempts to copy to a
 ;; directory tree in the target-dir shaped like:
@@ -154,30 +198,35 @@ SQL
 ;;
 ;; If the file can't be copied send a message to stderr.
 ;;
-(define (process-image path out)
+(define (process-image db path out)
   (let ((tags (tag-alist-from-file path '(model make date-time))))
     (if tags
-        (let* ((info (call-with-input-file path image-info))
-               (date (datetime->list (cdr (assq 'date-time tags))))
+        (let* ((filename (pathname-strip-directory path))
+               (info (call-with-input-file path image-info))
+               (date (get-datetime filename (cdr (assq 'date-time tags))))
                (dir (ensure-dir out date))
-               (filename (pathname-strip-directory path))
                (target-path (normalize-pathname
                              (string-append dir "/" filename)))
                (exif-tags tags)
-               (bytes-copied (copy-image path target-path)))
+               (bytes-copied (copy-image path target-path))
+               (opts (make-hash-table)))
 
-          (if bytes-copied
-              (create-entry
-               (zip-alist
-                '(info path target-path filename bytes-copied exif-tags)
-                `(,info ,path ,target-path ,filename ,bytes-copied ,exif-tags)))
-              (log-err "couldn't copy ~A" filename)))
+          (hash-table-set! opts 'path path)
+          (hash-table-set! opts 'target-path target-path)
+          (hash-table-set! opts 'filename filename)
+          (hash-table-set! opts 'bytes-copied bytes-copied)
+          (hash-table-set! opts 'exif-tags tags)
+          (hash-table-set! opts 'info info)
+
+          (if bytes-copied              
+              (create-entry db opts)
+              (log-err "couldn't copy ~A" filename))))
         (log-err "no exif for ~A" path))
-    #t))
+    #t)
 
-(define ((process-dir in out) path prev)
+(define ((process-dir db in out) path prev)
   (if (file-exists? path)
-      (process-image path out)
+      (process-image db path out)
       (begin
         (log-err "file doesn't exist: ~A" path)
         #f)))
@@ -208,9 +257,11 @@ SQL
       (begin
         (ensure-cache-dir)
         (ensure-db)
-        (find-files input-dir
-                    #:test is-jpeg?
-                    #:action (process-dir input-dir output-dir)))
+        (let ((db (get-db-handle)))
+          (find-files input-dir
+                      #:test is-jpeg?
+                      #:action (process-dir db input-dir output-dir))
+          (close-database db)))
       (log-err "input: ~A output: ~A" input-dir output-dir)))
 
 
