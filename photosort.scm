@@ -52,7 +52,7 @@
 
 (define CREATE-TABLE-PHOTOS #<<SQL
   CREATE TABLE IF NOT EXISTS photos
-  (hash TEXT NOT NULL UNIQUE,
+  (hash TEXT NOT NULL PRIMARY KEY,
         filename TEXT NOT NULL,
         original_path TEXT NOT NULL,
         new_path TEXT NOT NULL,
@@ -76,6 +76,14 @@ SQL
 
 (define (guard-false v)
   (if (equal? v #f) "" v))
+
+;; If the hash is present, then we update, else insert new row
+(define (persist-photo db row)
+  (if (not
+       (null? (query fetch (sql db "SELECT hash FROM photos WHERE hash = ?;")
+                     (hash-table-ref/default row 'hash ""))))
+      (update-photo db row)
+      (insert-photo db row)))
 
 (define (insert-photo db row)
   ;; '(info path target-path filename bytes-copied exif-tags)
@@ -101,6 +109,16 @@ datetime) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")
           make
           model
           (get-iso8601-datetime filename datetime))))
+
+;; If we're copying the same file somewhere, then just update the paths
+;; The sha1 hash would be the same if the file is unmodified.
+(define (update-photo db row)
+    (exec (sql db "UPDATE photos SET filename = ?, original_path = ?,
+new_path = ? WHERE hash = ?;")
+          (hash-table-ref row 'filename)
+          (hash-table-ref row 'path)
+          (hash-table-ref row 'target-path)
+          (hash-table-ref row 'hash)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Filesystem Operations
@@ -184,7 +202,7 @@ datetime) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")
 (define (create-entry db opts)
   (let ((sha (sha1sum (hash-table-ref opts 'target-path))))
     (hash-table-set! opts 'hash sha)
-    (insert-photo db opts)))
+    (persist-photo db opts)))
 
 ;; Pulls EXIF data from image and if present attempts to copy to a
 ;; directory tree in the target-dir shaped like:
