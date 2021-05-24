@@ -32,3 +32,21 @@ Files will be checked for date information and moved into a structure like:
 ### SQLite
 
 This program also stores information about the moved photos in a SQLite DB within your `~/.cache` directory. This might be useful if you want a record of what moved where, etc.
+
+### Refactor notes
+
+Have a single dispatch function that manages a photo object, wrapping it in a tagged list
+
+example:
+
+```scheme
+(define (dispatch (photo))
+  (match photo
+    [('BEGIN . xs) (get-filename xs)]
+    [('COPY . xs) (copy-photo xs)]
+    [('METADATA . xs) (persist-metadata xs)]
+    [('DONE . xs) (log-success xs)]
+    [('ERROR . xs) (log-error xs)]))
+```
+
+`xs` should probably be a hash or a record (SRFI-9)?
