@@ -40,13 +40,46 @@ Have a single dispatch function that manages a photo object, wrapping it in a ta
 example:
 
 ```scheme
-(define (dispatch (photo))
+(define (dispatch (photo)
   (match photo
-    [('BEGIN . xs) (get-filename xs)]
-    [('COPY . xs) (copy-photo xs)]
-    [('METADATA . xs) (persist-metadata xs)]
+    [('BEGIN . xs) (dispatch (get-filename xs))]
+    [('COPY . xs) (dispatch (copy-photo xs))]
+    [('METADATA . xs) (dispatch (persist-metadata xs))]
     [('DONE . xs) (log-success xs)]
-    [('ERROR . xs) (log-error xs)]))
+    [('ERROR . xs) (log-error xs)]
+    [_ (log-fail photo)])))
 ```
 
 `xs` should probably be a hash or a record (SRFI-9)?
+
+Maybe a macro?
+
+```scheme
+(define-dispatch photo
+  [begin -> get-filename]
+  [copy -> copy-photo]
+  [metadata -> persist-metadata]
+  [success -> log-success]
+  [error -> log-error]
+  [else #f])
+
+;; expands to:
+
+(define (dispatch-photo-begin xs) (dispatch-photo (list 'begin xs)))
+(define (dispatch-photo-copy xs) (dispatch-photo (list 'copy xs)))
+(define (dispatch-photo-metadata xs) (dispatch-photo (list 'metadata xs)))
+(define (dispatch-photo-success xs) (dispatch-photo (list 'success xs)))
+(define (dispatch-photo-error xs) (dispatch-photo (list 'error xs)))
+
+;; should we explicitly handle exceptions or should individual handlers?
+(define (dispatch-photo (photo)
+  (handle-exceptions exn
+    (dispatch-photo (list 'exception ((condition-property-accessor 'exn 'message) exn)))
+    (match photo
+      [('begin . xs) (get-filename xs)]
+      [('copy . xs) (copy-photo xs)]
+      [('metadata . xs) (persist-metadata xs)]
+      [('success . xs) (log-success xs)]
+      [('error . xs) (log-error xs)]
+      [_ ((lambda (x) #f) photo)]))))
+```
