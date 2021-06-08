@@ -1,27 +1,95 @@
 (import (chicken condition)
         (chicken format)
+        (chicken io)
         (chicken process-context)
         (chicken string)
         (chicken syntax)
         defstruct
         json
-        matchable)
+        matchable
+        srfi-1
+        srfi-19-core
+        srfi-19-io
+        srfi-69)
 
-(import-for-syntax (chicken string))
+(import-for-syntax (chicken string)
+                   srfi-13)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Logging
+
+(define TRACE "TRACE")
+(define DEBUG "DEBUG")
+(define INFO  "INFO")
+(define WARN  "WARN")
+(define ERROR "ERROR")
+(define FATAL "FATAL")
+
+(define *default-log-level* (make-parameter INFO))
+(define *default-log-stream* (make-parameter (current-output-port)))
+
+(define (%json-log p h)
+  (let ((out (if (port? p) p (*default-log-stream*)))
+        (o (if (hash-table? h) h (make-hash-table))))
+    (hash-table-set! o 'timestamp (timestamp))
+    (hash-table-update!/default o 'level identity (*default-log-level*))
+    (json-write o out)
+    (write-line "" out)))
+
+;; TODO: add checks for proper length
+(define (list->hash l)
+  (define (inner ps l)
+    (if (null? l)
+        (alist->hash-table ps)
+        (inner (append ps (list (cons (car l) (cadr l)))) (drop l 2))))
+  (inner '() l))
+
+(define-syntax define-logger
+  (er-macro-transformer
+   (lambda (exp rename compare)
+     (let* ((level-id (cadr exp))
+            (level-label (string-upcase (symbol->string level-id)))
+            (proc-id (string->symbol
+                     (conc "log-" (symbol->string level-id))))
+            (%define (rename 'define))
+            (%let (rename 'let))
+            (%hash-table-set! (rename 'hash-table-set!))
+            (%json-log (rename '%json-log))
+            (%list->hash (rename 'list->hash)))
+       `(,%define (,proc-id . kvs)
+                  (,%let ((h (,%list->hash kvs)))
+                         (,%hash-table-set! h 'level ,level-label)
+                         (,%json-log '() h)))))))
+
+(define-logger trace)
+(define-logger info)
+(define-logger debug)
+(define-logger warn)
+(define-logger error)
+(define-logger fatal)
+
+(define (log-debug2 h #!key (p (current-error-port)))
+  (hash-table-set! h 'level DEBUG)
+  (%json-log p h))
+
+(define (log-err2 h #!key (p (current-error-port)))
+  (hash-table-set! h 'level ERROR)
+  (%json-log p h))
 
 (define (%log p fmt r)
   (let ((out (if (port? p) p (current-error-port))))
     (apply fprintf p fmt r)
     (apply fprintf p "\n" '())))
 
-(define (log-err fmt #!rest r #!key (p (current-error-port)))
-  (%log p (string-append "ERR: " fmt) r))
+;; (define (log-err fmt #!rest r #!key (p (current-error-port)))
+;;   (%log p (string-append "ERR: " fmt) r))
 
-(define (log-debug fmt #!rest r #!key (p (current-output-port)))
-  (%log p (string-append "DEBUG: " fmt) r))
+;; (define (log-debug fmt #!rest r #!key (p (current-output-port)))
+;;   (%log p (string-append "DEBUG: " fmt) r))
+
+;; ISO 8601 of the current date/time
+(define (timestamp)
+  (date->string (current-date) "~4"))
 
 
 (defstruct photo filename)
@@ -33,7 +101,7 @@
     ((_ fn var)
      (begin
        (when verbose?
-         (log-debug "Proc ~A called with ~A" 'fn var))
+         (log-debug 'msg (format "Proc ~A called with ~A" 'fn var)))
        (fn var)))))
 
 (define-syntax define-dispatch
@@ -51,11 +119,11 @@
 (define-dispatch error)
 
 (define (stub p)
-  (log-debug "Stub called with ~A" p))
+  (log-debug 'msg (format "Stub called with ~A" p)))
 
 (define (dispatch photo)
   (when verbose?
-    (log-debug "Dispatch (dispatch ~A)" photo))
+    (log-debug 'msg (format "Dispatch (dispatch ~A)" photo)))
   (handle-exceptions
       exn
       (dispatch
@@ -65,7 +133,9 @@
       [('begin (? string? f)) (wrap-debug stub f)]
       [('success (? photo? p)) (wrap-debug stub p)]
       [('error . xs) (wrap-debug stub xs)]
-      [_ (log-err "No match for ~A" photo)])))
+      [_ (log-error 'msg (format "No match for ~A" photo))])))
+
+(log-fatal 'msg "shit went down!")
 
 (define p (make-photo "filename.jpg"))
 (dispatch-begin "filename.jpg")
@@ -73,3 +143,4 @@
 (dispatch-success p)
 (dispatch-begin 112)
 
+;; (fprintf (current-error-port) "~A" (list->alist '(1 2 3 4 5 "a" "b" "c")))
