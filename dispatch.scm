@@ -15,7 +15,7 @@
 (import-for-syntax (chicken string)
                    srfi-13)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Logging
 
 (define TRACE "TRACE")
@@ -81,6 +81,9 @@
    (current-date (utc-timezone-locale)) "~Y-~m-~dT~H:~M:~S.~N~z"))
 
 (defstruct photo filename)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Dispatching
 
 (define verbose? #f)
 
