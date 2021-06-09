@@ -75,14 +75,10 @@
 (define-logger error)
 (define-logger fatal)
 
-(define (%log p fmt r)
-  (let ((out (if (port? p) p (current-error-port))))
-    (apply fprintf p fmt r)
-    (apply fprintf p "\n" '())))
-
-;; ISO 8601 of the current date/time
+;; ISO 8601 of the current UTC date/time w nanoseconds
 (define (timestamp)
-  (date->string (current-date) "~4"))
+  (date->string
+   (current-date (utc-timezone-locale)) "~Y-~m-~dT~H:~M:~S.~N~z"))
 
 (defstruct photo filename)
 
@@ -93,7 +89,7 @@
     ((_ fn var)
      (begin
        (when verbose?
-         (log-debug 'msg (format "Proc ~A called with ~A" 'fn var)))
+         (log-debug 'proc 'fn 'msg (format "args: ~A" var)))
        (fn var)))))
 
 (define-syntax define-dispatch
