@@ -30,18 +30,25 @@
 
 (define (%json-log p h)
   (let ((out (if (port? p) p (*default-log-stream*)))
-        (o (if (hash-table? h) h (make-hash-table))))
+        (o (if (hash-table? h) h (make-hash-table eq? symbol-hash))))
     (hash-table-set! o 'timestamp (timestamp))
     (hash-table-update!/default o 'level identity (*default-log-level*))
     (json-write o out)
     (write-line "" out)))
 
+(define (->symbol x)
+  (cond [(symbol? x) x]
+        [(string? x) (string->symbol x)]
+        [(number? x) (string->symbol (number->string x))]
+        [else (gensym "invalid-field")]))
+
 ;; TODO: add checks for proper length
 (define (list->hash l)
   (define (inner ps l)
     (if (null? l)
-        (alist->hash-table ps)
-        (inner (append ps (list (cons (car l) (cadr l)))) (drop l 2))))
+        (alist->hash-table ps #:test eq? #:hash symbol-hash)
+        (inner
+         (append ps (list (cons (->symbol (car l)) (cadr l)))) (drop l 2))))
   (inner '() l))
 
 (define-syntax define-logger
@@ -50,7 +57,7 @@
      (let* ((level-id (cadr exp))
             (level-label (string-upcase (symbol->string level-id)))
             (proc-id (string->symbol
-                     (conc "log-" (symbol->string level-id))))
+                      (conc "log-" (symbol->string level-id))))
             (%define (rename 'define))
             (%let (rename 'let))
             (%hash-table-set! (rename 'hash-table-set!))
@@ -68,29 +75,14 @@
 (define-logger error)
 (define-logger fatal)
 
-(define (log-debug2 h #!key (p (current-error-port)))
-  (hash-table-set! h 'level DEBUG)
-  (%json-log p h))
-
-(define (log-err2 h #!key (p (current-error-port)))
-  (hash-table-set! h 'level ERROR)
-  (%json-log p h))
-
 (define (%log p fmt r)
   (let ((out (if (port? p) p (current-error-port))))
     (apply fprintf p fmt r)
     (apply fprintf p "\n" '())))
 
-;; (define (log-err fmt #!rest r #!key (p (current-error-port)))
-;;   (%log p (string-append "ERR: " fmt) r))
-
-;; (define (log-debug fmt #!rest r #!key (p (current-output-port)))
-;;   (%log p (string-append "DEBUG: " fmt) r))
-
 ;; ISO 8601 of the current date/time
 (define (timestamp)
   (date->string (current-date) "~4"))
-
 
 (defstruct photo filename)
 
@@ -135,7 +127,7 @@
       [('error . xs) (wrap-debug stub xs)]
       [_ (log-error 'msg (format "No match for ~A" photo))])))
 
-(log-fatal 'msg "shit went down!")
+(log-fatal 'msg "shit went down!" 12 "number" "foo" "bar" '() '(1 2 3))
 
 (define p (make-photo "filename.jpg"))
 (dispatch-begin "filename.jpg")
