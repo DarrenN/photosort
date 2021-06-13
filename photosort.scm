@@ -1,5 +1,6 @@
 (import (chicken condition)
         (chicken file)
+        (chicken file posix)
         (chicken format)
         (chicken io)
         (chicken pathname)
@@ -280,6 +281,59 @@ new_path = ? WHERE hash = ?;")
 ;;
 ;; If the file can't be copied send a message to stderr.
 ;;
+(define (aget k a)
+  (if (or (not a) (null? a))
+      #f
+      (let ((v (assq k a)))
+        (if (null? v)
+            #f
+            (cdr v)))))
+
+(define (extract-tags photo)
+  (let ((tags (tag-alist-from-file (photo-filename photo)
+                                   '(model make date-time))))
+    (when tags
+      (photo-exif-tags-set! photo tags))
+    photo))
+
+;; image-info will throw unexpected EOF errors which we need to handle
+(define (get-image-info photo)
+  (handle-exceptions
+      exn
+      (begin
+        (log-warn 'msg
+                  (format "Couldn't get image-info for ~A ~A"
+                          (photo-filename photo)
+                          ((condition-property-accessor 'exn 'message) exn)))
+        photo)
+    (let ((info (call-with-input-file (photo-filename photo) image-info)))
+      (when info
+        (photo-info-set! photo info))
+      photo)))
+
+;; file-modification-time will also throw if it can't find the file, which we
+;; should have caught already, so let it bubble up
+(define (get-image-mtime photo)
+  (let ((mtime (file-modification-time (photo-filename photo))))
+      (when mtime
+        (photo-mtime-set! photo mtime))
+      photo))
+
+(define (get-metadata photo)
+  (dispatch-get-filename
+   (get-image-mtime (get-image-info (extract-tags photo)))))
+
+(define (get-filename photo)
+  (let ((og-filename (pathname-strip-directory (photo-filename photo)))
+        (date-time (aget 'date-time (photo-exif-tags photo)))
+        (mtime (photo-mtime photo)))
+    ;; Now we need to work our way through the following:
+    ;; - if DT then make an ISO8601 filename
+    ;; - else if we can parse a date from filename, use that
+    ;; - else convert mtime seconds to ISO8601 filename
+    (log-debug 'msg (format "ogf: ~A | dt: ~A | mtime: ~A"
+                            og-filename date-time mtime))))
+
 (define (process-image db path out)
   (let ((tags (tag-alist-from-file path '(model make date-time))))
     (if tags
@@ -319,13 +373,8 @@ new_path = ? WHERE hash = ?;")
 (define (check-file-path p)
   (let ((f (photo-filename p)))
     (if (and f (file-exists? f))
-        (dispatch-extract-tags p)
+        (dispatch-get-metadata p)
         (dispatch-error (format "~A is not a valid file" f)))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Handlers
-
-(defstruct photo db filename input-dir output-dir)
 
 (define ((dispatch-photo db in out) path prev)
   (dispatch-begin
@@ -334,11 +383,16 @@ new_path = ? WHERE hash = ?;")
                output-dir: out
                filename: path)))
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Generic Handlers
+
 (define (handle-error xs)
   (log-error 'msg (format "~A" xs)))
 
 (define (stub p)
   (log-debug 'msg (format "Stub called with ~A" (photo->alist p))))
+
+(defstruct photo db filename input-dir output-dir exif-tags info mtime)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Dispatching
@@ -366,18 +420,25 @@ new_path = ? WHERE hash = ?;")
 (define (dispatch photo)
   (when verbose?
     (log-debug 'msg (format "Dispatch (dispatch ~A)" photo)))
+  (match photo
+      [('begin (? photo? p)) (wrap-debug check-file-path p)]
+      [('get-metadata (? photo? p)) (wrap-debug get-metadata p)]
+      [('get-filename (? photo? p)) (wrap-debug get-filename p)]
+      [('error . xs) (wrap-debug handle-error xs)]
+      [_ (log-error 'msg (format "No match for ~A" photo))])
   (handle-exceptions
       exn
-      (dispatch-error ((condition-property-accessor 'exn 'message) exn))
-    (match photo
-      [('begin (? photo? p)) (wrap-debug check-file-path p)]
-      [('success (? photo? p)) (wrap-debug stub p)]
-      [('error . xs) (wrap-debug handle-error xs)]
-      [_ (log-error 'msg (format "No match for ~A" photo))])))
+      (dispatch-error
+       (format "~A ~A ~A"
+               ((condition-property-accessor 'exn 'message) exn)
+               ((condition-property-accessor 'exn 'arguments) exn)
+               ((condition-property-accessor 'exn 'location) exn)))
+    1))
 
 (define-dispatch begin)
-(define-dispatch extract-tags)
 (define-dispatch error)
+(define-dispatch get-filename)
+(define-dispatch get-metadata)
 
 ;; Accepts two command line args:
 ;;
