@@ -3,6 +3,7 @@
         (chicken file posix)
         (chicken format)
         (chicken io)
+        (chicken irregex)
         (chicken pathname)
         (chicken platform)
         (chicken process-context)
@@ -220,30 +221,43 @@ new_path = ? WHERE hash = ?;")
       (datetime->list dt)
       (datetime->list filename)))
 
-;; Convert "YYYY:MM:DD HH:MM:SS" to '("YYYY" "MM" "DD")
-(define (datetime->list dt)
+;; Convert "YYYY:MM:DD HH:MM:SS" to '("YYYY" "MM" "DD" ...)
+;; for use in ensure-dir
+(define (date-string->list dt)
   (if (not dt)
       (datetime->list "1970:01:01 00:00:00")
       (string-tokenize (car (string-tokenize dt)) char-set:digit)))
 
+;; Convert "YYYY:MM:DD HH:MM:SS" to ISO 8601 string
+(define (exif-datetime->iso8601 dt)
+  (let* ((tokens (string-tokenize dt char-set:digit))
+         (date (take tokens 3))
+         (time (drop tokens 3)))
+    (string-append (string-join date "-") "T" (string-join time ":") ".000Z")))
+
 (define (get-iso8601-datetime filename dt)
   (if (not dt)
       (filename->iso8601 filename)
-      (datetime->iso8601 dt)))
+      (datestring->iso8601 dt)))
 
 ;; Convert "YYYY-MM-DD HH.MM.SS-x-x.jpg" to "YYYY-MM-DD HH:MM:SS.000"
 (define (filename->iso8601 filename)
   (let* ((tokens (string-tokenize filename))
          (date (string-tokenize (car tokens) char-set:digit))
          (time (take (string-tokenize (cadr tokens) char-set:digit) 3)))
-    (string-append (string-join date "-") " " (string-join time ":") ".000")))
+    (string-append (string-join date "-") "T " (string-join time ":") ".000Z")))
 
 ;; 2021:02:13 16:18:41
 ;; Convert "YYYY:MM:DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS.000"
-(define (datetime->iso8601 dt)
+(define (datestring->iso8601 dt)
   (let* ((tokens (string-tokenize dt))
          (date (string-tokenize (car tokens) char-set:digit)))
     (string-append (string-join date "-") " " (cadr tokens) ".000")))
+
+;; Converts epoch seconss to iso8601
+(define (seconds->iso8601 n)
+  (date->string
+   (seconds->date n #f) "~Y-~m-~dT~H:~M:~S.000Z"))
 
 ;; ISO 8601 of the current UTC date/time w nanoseconds
 (define (timestamp)
@@ -259,7 +273,7 @@ new_path = ? WHERE hash = ?;")
 (define (copy-image path target-path)
   (handle-exceptions exn
       (begin
-	(log-err ((condition-property-accessor 'exn 'message) exn))
+	(log-warn 'msg ((condition-property-accessor 'exn 'message) exn))
         #f)
     (copy-file path target-path)))
 
@@ -320,19 +334,48 @@ new_path = ? WHERE hash = ?;")
       photo))
 
 (define (get-metadata photo)
-  (dispatch-get-filename
+  (dispatch-get-filedate
    (get-image-mtime (get-image-info (extract-tags photo)))))
 
-(define (get-filename photo)
+(define re-filename-date
+  (sre->irregex
+   '(seq (= 4 numeric) "-" (= 2 numeric) "-" (= 2 numeric) space
+         (= 2 numeric) (or "." ":") (= 2 numeric) (or "." ":") (= 2 numeric)
+         "." (or "jpg" "jpeg"))))
+
+;; Inspect the file to determine the best possible date
+(define (get-filedate photo)
   (let ((og-filename (pathname-strip-directory (photo-filename photo)))
         (date-time (aget 'date-time (photo-exif-tags photo)))
         (mtime (photo-mtime photo)))
+
     ;; Now we need to work our way through the following:
     ;; - if DT then make an ISO8601 filename
     ;; - else if we can parse a date from filename, use that
     ;; - else convert mtime seconds to ISO8601 filename
-    (log-debug 'msg (format "ogf: ~A | dt: ~A | mtime: ~A"
-                            og-filename date-time mtime))))
+    (define filedate
+      (cond [date-time (exif-datetime->iso8601 date-time)]
+            [(irregex-match re-filename-date og-filename)
+             (filename->iso8601 og-filename)]
+            [mtime (seconds->iso8601 mtime)]
+            [else "1970-01-01T00:00:00.000Z"]))
+    (photo-date-set! photo filedate)
+    (dispatch-copy-file photo)))
+
+(define (copy-photo photo)
+  (let* ((og-filename (pathname-strip-directory (photo-filename photo)))
+         (target-dir
+          (ensure-dir
+           (photo-output-dir photo) (date-string->list (photo-date photo))))
+         (target-path (normalize-pathname
+                       (string-append target-dir "/" og-filename)))
+         (bytes-copied (copy-image (photo-filename photo) target-path)))
+    (photo-output-path-set! photo target-path)
+    (if bytes-copied
+        (begin
+          (photo-bytes-set! photo bytes-copied)
+          (dispatch-insert-entry photo))
+        (dispatch-error (format "Couldn't copy ~A" target-path)))))
 
 (define (process-image db path out)
   (let ((tags (tag-alist-from-file path '(model make date-time))))
@@ -392,7 +435,8 @@ new_path = ? WHERE hash = ?;")
 (define (stub p)
   (log-debug 'msg (format "Stub called with ~A" (photo->alist p))))
 
-(defstruct photo db filename input-dir output-dir exif-tags info mtime)
+(defstruct photo
+  db filename input-dir output-dir output-path exif-tags info mtime date bytes)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Dispatching
@@ -423,7 +467,9 @@ new_path = ? WHERE hash = ?;")
   (match photo
       [('begin (? photo? p)) (wrap-debug check-file-path p)]
       [('get-metadata (? photo? p)) (wrap-debug get-metadata p)]
-      [('get-filename (? photo? p)) (wrap-debug get-filename p)]
+      [('get-filedate (? photo? p)) (wrap-debug get-filedate p)]
+      [('copy-file (? photo? p)) (wrap-debug copy-photo p)]
+      [('insert-entry (? photo? p) (wrap-debug stub p))]
       [('error . xs) (wrap-debug handle-error xs)]
       [_ (log-error 'msg (format "No match for ~A" photo))])
   (handle-exceptions
@@ -436,8 +482,10 @@ new_path = ? WHERE hash = ?;")
     1))
 
 (define-dispatch begin)
+(define-dispatch copy-file)
 (define-dispatch error)
-(define-dispatch get-filename)
+(define-dispatch insert-entry)
+(define-dispatch get-filedate)
 (define-dispatch get-metadata)
 
 ;; Accepts two command line args:
