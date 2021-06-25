@@ -9,6 +9,7 @@
         (chicken process-context)
         (chicken string)
         (chicken syntax)
+        (clojurian syntax)
         defstruct
         exif
         image-dimensions
@@ -273,7 +274,11 @@ new_path = ? WHERE hash = ?;")
 (define (copy-image path target-path)
   (handle-exceptions exn
       (begin
-	(log-warn 'msg ((condition-property-accessor 'exn 'message) exn))
+	(log-warn 'proc "copy-image"
+                  'path path
+                  'targetPath target-path
+                  'type "exception"
+                  'msg ((condition-property-accessor 'exn 'message) exn))
         #f)
     (copy-file path target-path)))
 
@@ -333,9 +338,8 @@ new_path = ? WHERE hash = ?;")
         (photo-mtime-set! photo mtime))
       photo))
 
-(define (get-metadata photo)
-  (dispatch-get-filedate
-   (get-image-mtime (get-image-info (extract-tags photo)))))
+(define (step2-get-metadata photo)
+  (get-image-mtime (get-image-info (extract-tags photo))))
 
 (define re-filename-date
   (sre->irregex
@@ -344,7 +348,7 @@ new_path = ? WHERE hash = ?;")
          "." (or "jpg" "jpeg"))))
 
 ;; Inspect the file to determine the best possible date
-(define (get-filedate photo)
+(define (step3-get-filedate photo)
   (let ((og-filename (pathname-strip-directory (photo-filename photo)))
         (date-time (aget 'date-time (photo-exif-tags photo)))
         (mtime (photo-mtime photo)))
@@ -360,9 +364,9 @@ new_path = ? WHERE hash = ?;")
             [mtime (seconds->iso8601 mtime)]
             [else "1970-01-01T00:00:00.000Z"]))
     (photo-date-set! photo filedate)
-    (dispatch-copy-file photo)))
+    photo))
 
-(define (copy-photo photo)
+(define (step4-copy-photo photo)
   (let* ((og-filename (pathname-strip-directory (photo-filename photo)))
          (target-dir
           (ensure-dir
@@ -374,34 +378,9 @@ new_path = ? WHERE hash = ?;")
     (if bytes-copied
         (begin
           (photo-bytes-set! photo bytes-copied)
-          (dispatch-insert-entry photo))
-        (dispatch-error (format "Couldn't copy ~A" target-path)))))
-
-(define (process-image db path out)
-  (let ((tags (tag-alist-from-file path '(model make date-time))))
-    (if tags
-        (let* ((filename (pathname-strip-directory path))
-               (info (call-with-input-file path image-info))
-               (date (get-datetime filename (cdr (assq 'date-time tags))))
-               (dir (ensure-dir out date))
-               (target-path (normalize-pathname
-                             (string-append dir "/" filename)))
-               (exif-tags tags)
-               (bytes-copied (copy-image path target-path))
-               (opts (make-hash-table)))
-
-          (hash-table-set! opts 'path path)
-          (hash-table-set! opts 'target-path target-path)
-          (hash-table-set! opts 'filename filename)
-          (hash-table-set! opts 'bytes-copied bytes-copied)
-          (hash-table-set! opts 'exif-tags tags)
-          (hash-table-set! opts 'info info)
-
-          (if bytes-copied              
-              (create-entry db opts)
-              (log-err "couldn't copy ~A" filename)))
-        (log-err "no exif for ~A" path)))
-    #t)
+          photo)
+        (log-error-and-false "step4-copy-photo"
+                             (format "Couldn't copy ~A" target-path)))))
 
 ;; We're only interested in certain types of files
 ;; primarily JPGs Maybe mp4 / mov?
@@ -413,18 +392,17 @@ new_path = ? WHERE hash = ?;")
         #t
         #f)))
 
-(define (check-file-path p)
+(define (step1-check-file-path p)
   (let ((f (photo-filename p)))
     (if (and f (file-exists? f))
-        (dispatch-get-metadata p)
-        (dispatch-error (format "~A is not a valid file" f)))))
+        p
+        (log-error-and-false "step1-check-file-path"
+                             (format "~A is not a valid file" f)))))
 
-(define ((dispatch-photo db in out) path prev)
-  (dispatch-begin
-   (make-photo db: db
-               input-dir: in
-               output-dir: out
-               filename: path)))
+(define (log-error-and-false proc msg)
+  (log-error 'proc proc
+             'msg msg)
+  #f)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Generic Handlers
@@ -439,54 +417,49 @@ new_path = ? WHERE hash = ?;")
   db filename input-dir output-dir output-path exif-tags info mtime date bytes)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Dispatching
+;; Processing Pipeline
 
 (define verbose? #f)
 
-(define-syntax wrap-debug
+;; Creates a handler function with db in out bound to the returned closure.
+;; This is specifically to be passed to the find-files #:action argument
+;; which passes in a path string (path) and a previous value (prev).
+;; The closure creates a photo? record and hands off to process-photo pipeline.
+(define ((handle-photo db in out) path prev)
+  (process-photo
+   (make-photo db: db
+               input-dir: in
+               output-dir: out
+               filename: path)))
+
+;; Guard functions passed to and->
+;; Ensures first value input to fn is pred? or returns #f
+;; Handles exception by logging a warning and returns #f
+(define-syntax guard/and->
   (syntax-rules ()
-    ((_ fn var)
-     (begin
-       (when verbose?
-         (log-debug 'proc 'fn 'msg (format "args: ~A" var)))
-       (fn var)))))
+    ((_ val pred? fn args ...)
+     (handle-exceptions exn
+         (begin
+	   (log-warn 'type "exception"
+                     'msg ((condition-property-accessor 'exn 'message) exn))
+           #f)
+         (if (pred? val)
+             (apply fn (append (list val) (list args ...)))
+             #f)))))
 
-(define-syntax define-dispatch
-  (er-macro-transformer
-   (lambda (exp rename compare)
-     (let* ((dispatch-id (cadr exp))
-            (new-id (string->symbol
-                     (conc "dispatch-" (symbol->string dispatch-id))))
-            (%define (rename 'define))
-            (%dispatch (rename 'dispatch)))
-       `(,%define (,new-id p) (,%dispatch (list ',dispatch-id p)))))))
-
-(define (dispatch photo)
+;; Passes photo? through an and-> pipeline of guarded functions
+(define (process-photo photo)
   (when verbose?
-    (log-debug 'msg (format "Dispatch (dispatch ~A)" photo)))
-  (match photo
-      [('begin (? photo? p)) (wrap-debug check-file-path p)]
-      [('get-metadata (? photo? p)) (wrap-debug get-metadata p)]
-      [('get-filedate (? photo? p)) (wrap-debug get-filedate p)]
-      [('copy-file (? photo? p)) (wrap-debug copy-photo p)]
-      [('insert-entry (? photo? p) (wrap-debug stub p))]
-      [('error . xs) (wrap-debug handle-error xs)]
-      [_ (log-error 'msg (format "No match for ~A" photo))])
-  (handle-exceptions
-      exn
-      (dispatch-error
-       (format "~A ~A ~A"
-               ((condition-property-accessor 'exn 'message) exn)
-               ((condition-property-accessor 'exn 'arguments) exn)
-               ((condition-property-accessor 'exn 'location) exn)))
-    1))
-
-(define-dispatch begin)
-(define-dispatch copy-file)
-(define-dispatch error)
-(define-dispatch insert-entry)
-(define-dispatch get-filedate)
-(define-dispatch get-metadata)
+    (log-debug 'proc "process-photo"
+               'msg (format "received ~A" photo)))
+  (let ((result (and-> photo
+                       (guard/and-> photo? step1-check-file-path)
+                       (guard/and-> photo? step2-get-metadata)
+                       (guard/and-> photo? step3-get-filedate)
+                       (guard/and-> photo? step4-copy-photo))))
+    (unless result
+      (log-warn 'proc "process-photo"
+                'msg (format "Couldn't process ~A" (photo-filename photo))))))
 
 ;; Accepts two command line args:
 ;;
@@ -504,10 +477,11 @@ new_path = ? WHERE hash = ?;")
       (begin
         (ensure-cache-dir)
         (ensure-db)
-        (let ((db (get-db-handle)))
+        (let* ((db (get-db-handle))
+               (handler (handle-photo db input-dir output-dir)))
           (find-files input-dir
                       #:test is-jpeg?
-                      #:action (dispatch-photo db input-dir output-dir))
+                      #:action handler)
           (close-database db)))
       (log-error 'msg (format "input: ~A output: ~A" input-dir output-dir))))
 
