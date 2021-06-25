@@ -4,6 +4,7 @@
         (chicken process-context)
         (chicken string)
         (chicken syntax)
+        (clojurian syntax)
         defstruct
         json
         matchable
@@ -85,7 +86,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Dispatching
 
-(define verbose? #f)
+(define verbose? #t)
 
 (define-syntax wrap-debug
   (syntax-rules ()
@@ -94,6 +95,27 @@
        (when verbose?
          (log-debug 'proc 'fn 'msg (format "args: ~A" var)))
        (fn var)))))
+
+  (handle-exceptions exn
+      (begin
+	(log-warn 'msg ((condition-property-accessor 'exn 'message) exn))
+        #f)
+    (copy-file path target-path))
+
+;; Guard functions passed to and->
+;; Ensures first value input to fn is pred? or returns #f
+;; Handles exception by logging a warning and returns #f
+(define-syntax guard/and->
+  (syntax-rules ()
+    ((_ val pred? fn args ...)
+     (handle-exceptions exn
+         (begin
+	   (log-warn 'type "exception"
+                     'msg ((condition-property-accessor 'exn 'message) exn))
+           #f)
+         (if (pred? val)
+             (apply fn (append (list val) (list args ...)))
+             #f)))))
 
 (define-syntax define-dispatch
   (er-macro-transformer
@@ -109,8 +131,12 @@
 (define-dispatch success)
 (define-dispatch error)
 
-(define (stub p)
-  (log-debug 'msg (format "Stub called with ~A" p)))
+(define (stub p . args)
+  (log-debug 'msg (format "Stub called with ~A" p) 'args args)
+  p)
+
+(define (raise p . args)
+  (signal (make-property-condition 'exn 'message "Ahhh")))
 
 (define (dispatch photo)
   (when verbose?
@@ -126,12 +152,18 @@
       [('error . xs) (wrap-debug stub xs)]
       [_ (log-error 'msg (format "No match for ~A" photo))])))
 
-(log-fatal 'msg "shit went down!" 12 "number" "foo" "bar" '() '(1 2 3))
+;; (log-fatal 'msg "shit went down!" 12 "number" "foo" "bar" '() '(1 2 3))
 
-(define p (make-photo "filename.jpg"))
-(dispatch-begin "filename.jpg")
-(dispatch-error "oops had an error")
-(dispatch-success p)
-(dispatch-begin 112)
+;; (define p (make-photo "filename.jpg"))
+;; (dispatch-begin "filename.jpg")
+;; (dispatch-error "oops had an error")
+;; (dispatch-success p)
+;; (dispatch-begin 112)
+
+(print
+ (and-> (make-photo "ANS->.jpg")
+        (guard/and-> photo? stub 1 2)
+        (guard/and-> photo? stub)
+        (guard/and-> photo? raise 3 4)))
 
 ;; (fprintf (current-error-port) "~A" (list->alist '(1 2 3 4 5 "a" "b" "c")))
