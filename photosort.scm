@@ -50,7 +50,7 @@
 (define FATAL "FATAL")
 
 (define *default-log-level* (make-parameter INFO))
-(define *default-log-stream* (make-parameter (current-output-port)))
+(define *default-log-stream* (make-parameter (current-error-port)))
 
 (define (%json-log p h)
   (let ((out (if (port? p) p (*default-log-stream*)))
