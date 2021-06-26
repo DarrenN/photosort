@@ -286,19 +286,6 @@ new_path = ? WHERE hash = ?;")
         #f)
     (copy-file path target-path)))
 
-;; Pulls EXIF data from image and if present attempts to copy to a
-;; directory tree in the target-dir shaped like:
-;;
-;; <YEAR>
-;; └── <MONTH>
-;;     └── <FILENAME>
-;;     └── ...
-;;
-;; Then insert into the SQLite table keye on SHA1 hash.
-;;
-;; If the file can't be copied send a message to stderr.
-;;
-
 (define (aget k a)
   (if (or (not a) (null? a))
       #f
@@ -419,13 +406,7 @@ new_path = ? WHERE hash = ?;")
   #f)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Generic Handlers
-
-(define (handle-error xs)
-  (log-error 'msg (format "~A" xs)))
-
-(define (stub p)
-  (log-debug 'msg (format "Stub called with ~A" (photo->alist p))))
+;; Structs
 
 (defstruct photo
   db filename input-dir output-dir output-path exif-tags info mtime date bytes
@@ -485,6 +466,18 @@ new_path = ? WHERE hash = ?;")
 ;;
 ;; input-dir - directory to scan for files
 ;; output-dir - directory to copy new file structure to
+;;
+;; Pulls EXIF data from image and if present attempts to copy to a
+;; directory tree in the target-dir shaped like:
+;;
+;; <YEAR>
+;; └── <MONTH>
+;;     └── <FILENAME>
+;;     └── ...
+;;
+;; Then insert into the SQLite table keye on SHA1 hash.
+;;
+;; If the file can't be copied send a message to stderr.
 ;;
 (define (main args)
   (define-values
