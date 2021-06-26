@@ -138,48 +138,52 @@ SQL
 (define (guard-false v)
   (if (equal? v #f) "" v))
 
-;; If the hash is present, then we update, else insert new row
-(define (persist-photo db row)
+(define (step6-persist-to-db photo)
   (if (not
-       (null? (query fetch (sql db "SELECT hash FROM photos WHERE hash = ?;")
-                     (hash-table-ref/default row 'hash ""))))
-      (update-photo db row)
-      (insert-photo db row)))
+       (null?
+        (query fetch
+               (sql (photo-db photo) "SELECT hash FROM photos WHERE hash = ?;")
+               (photo-sha1 photo))))
+      (update-photo photo)
+      (insert-photo photo)))
 
-(define (insert-photo db row)
-  ;; '(info path target-path filename bytes-copied exif-tags)
-  ;; (png 10 20 0) type w h rot
-  (let* ((tags (hash-table-ref row 'exif-tags))
-         (make (guard-false (cdr (assq 'make tags))))
-         (model (guard-false (cdr (assq 'model tags))))
-         (datetime (cdr (assq 'date-time tags)))
-         (filename (hash-table-ref row 'filename))
-         (info (hash-table-ref row 'info)))
+(define (insert-photo photo)
+  (let* ((tags (photo-exif-tags photo))
+         (make (guard-false (aget 'make tags)))
+         (model (guard-false (aget 'model tags)))
+         (datetime (aget 'date-time tags))
+         (info (photo-info photo))
+         (width (if info (cadr info) 0))
+         (height (if info (caddr info) 0))
+         (type (if info (symbol->string (car info)) "")))
 
-    (exec (sql db "INSERT OR IGNORE INTO photos(hash, filename,
+    (exec (sql (photo-db photo) "INSERT OR IGNORE INTO photos(hash, filename,
 original_path, new_path, filesize, width, height, type, make, model,
 datetime) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")
-          (hash-table-ref row 'hash)
-          filename
-          (hash-table-ref row 'path)
-          (hash-table-ref row 'target-path)
-          (hash-table-ref/default row 'bytes-copied 0)
-          (cadr info)
-          (caddr info)
-          (symbol->string (car info))
+          (photo-sha1 photo)        ; hash
+          (photo-filename photo)    ; filename
+          (photo-input-dir photo)   ; original_path
+          (photo-output-path photo) ; new_path
+          (photo-bytes photo)       ; filesize
+          width
+          height
+          type
           make
           model
-          (get-iso8601-datetime filename datetime))))
+          (photo-date photo))       ; datetime (ISO8601)
+    photo))
 
 ;; If we're copying the same file somewhere, then just update the paths
 ;; The sha1 hash would be the same if the file is unmodified.
-(define (update-photo db row)
-    (exec (sql db "UPDATE photos SET filename = ?, original_path = ?,
+(define (update-photo photo)
+  (exec (sql (photo-db photo)
+             "UPDATE photos SET filename = ?, original_path = ?,
 new_path = ? WHERE hash = ?;")
-          (hash-table-ref row 'filename)
-          (hash-table-ref row 'path)
-          (hash-table-ref row 'target-path)
-          (hash-table-ref row 'hash)))
+        (photo-filename photo)
+        (photo-input-dir photo)
+        (photo-output-path photo)
+        (photo-sha1 photo))
+  photo)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Filesystem Operations
@@ -282,12 +286,6 @@ new_path = ? WHERE hash = ?;")
         #f)
     (copy-file path target-path)))
 
-;; Get a SHA1 hash of the copied file and insert metadata into DB
-(define (create-entry db opts)
-  (let ((sha (sha1sum (hash-table-ref opts 'target-path))))
-    (hash-table-set! opts 'hash sha)
-    (persist-photo db opts)))
-
 ;; Pulls EXIF data from image and if present attempts to copy to a
 ;; directory tree in the target-dir shaped like:
 ;;
@@ -300,6 +298,7 @@ new_path = ? WHERE hash = ?;")
 ;;
 ;; If the file can't be copied send a message to stderr.
 ;;
+
 (define (aget k a)
   (if (or (not a) (null? a))
       #f
@@ -382,6 +381,21 @@ new_path = ? WHERE hash = ?;")
         (log-error-and-false "step4-copy-photo"
                              (format "Couldn't copy ~A" target-path)))))
 
+
+;; Calculate the SHA1 of the copied image file. We use this as a unique
+;; id in the SQLite DB
+(define (step5-get-hash photo)
+  (let ((sha (sha1sum (photo-output-path photo))))
+    (photo-sha1-set! photo sha)
+    photo))
+
+;; Get a SHA1 hash of the copied file and insert metadata into DB
+(define (create-entry db opts)
+  (let ((sha (sha1sum (hash-table-ref opts 'target-path))))
+    (hash-table-set! opts 'hash sha)
+    (persist-photo db opts)))
+
+
 ;; We're only interested in certain types of files
 ;; primarily JPGs Maybe mp4 / mov?
 (define (is-jpeg? path)
@@ -414,7 +428,8 @@ new_path = ? WHERE hash = ?;")
   (log-debug 'msg (format "Stub called with ~A" (photo->alist p))))
 
 (defstruct photo
-  db filename input-dir output-dir output-path exif-tags info mtime date bytes)
+  db filename input-dir output-dir output-path exif-tags info mtime date bytes
+  sha1)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Processing Pipeline
@@ -441,6 +456,9 @@ new_path = ? WHERE hash = ?;")
      (handle-exceptions exn
          (begin
 	   (log-warn 'type "exception"
+                     'guardedProc (format "~A" fn)
+                     'value (format "~A" val)
+                     'proc "guard/and->"
                      'msg ((condition-property-accessor 'exn 'message) exn))
            #f)
          (if (pred? val)
@@ -456,7 +474,9 @@ new_path = ? WHERE hash = ?;")
                        (guard/and-> photo? step1-check-file-path)
                        (guard/and-> photo? step2-get-metadata)
                        (guard/and-> photo? step3-get-filedate)
-                       (guard/and-> photo? step4-copy-photo))))
+                       (guard/and-> photo? step4-copy-photo)
+                       (guard/and-> photo? step5-get-hash)
+                       (guard/and-> photo? step6-persist-to-db))))
     (unless result
       (log-warn 'proc "process-photo"
                 'msg (format "Couldn't process ~A" (photo-filename photo))))))
