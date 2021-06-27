@@ -15,7 +15,6 @@
         image-dimensions
         json
         list-utils
-        matchable
         simple-sha1
         sql-de-lite
         srfi-1
