@@ -1,18 +1,32 @@
 (import (chicken condition)
         (chicken file)
+        (chicken file posix)
         (chicken format)
+        (chicken io)
+        (chicken irregex)
         (chicken pathname)
         (chicken platform)
         (chicken process-context)
+        (chicken string)
+        (chicken syntax)
+        (clojurian syntax)
+        defstruct
         exif
         image-dimensions
+        json
         list-utils
+        matchable
         simple-sha1
         sql-de-lite
         srfi-1
         srfi-13
         srfi-14
+        srfi-19-core
+        srfi-19-io
         srfi-69)
+
+(import-for-syntax (chicken string)
+                   srfi-13)
 
 ;; 1. pull filenames from Camera Uploads dir
 ;; 2. use simple-sha1, exif and image-dimensions to get the sha1sum,
@@ -24,19 +38,66 @@
 ;; 7. Add row in sqlite DB with: sha, filename, new path, datetime,
 ;;    width, height, type
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Logging
 
-(define (%log p fmt r)
-  (let ((out (if (port? p) p (current-error-port))))
-    (apply fprintf p fmt r)
-    (apply fprintf p "\n" '())))
+(define TRACE "TRACE")
+(define DEBUG "DEBUG")
+(define INFO  "INFO")
+(define WARN  "WARN")
+(define ERROR "ERROR")
+(define FATAL "FATAL")
 
-(define (log-err fmt #!rest r #!key (p (current-error-port)))
-  (%log p (string-append "ERR: " fmt) r))
+(define *default-log-level* (make-parameter INFO))
+(define *default-log-stream* (make-parameter (current-error-port)))
 
-(define (log-debug fmt #!rest r #!key (p (current-output-port)))
-  (%log p (string-append "DEBUG: " fmt) r))
+(define (%json-log p h)
+  (let ((out (if (port? p) p (*default-log-stream*)))
+        (o (if (hash-table? h) h (make-hash-table eq? symbol-hash))))
+    (hash-table-set! o 'timestamp (timestamp))
+    (hash-table-update!/default o 'level identity (*default-log-level*))
+    (json-write o out)
+    (write-line "" out)))
+
+(define (->symbol x)
+  (cond [(symbol? x) x]
+        [(string? x) (string->symbol x)]
+        [(number? x) (string->symbol (number->string x))]
+        [else (gensym "invalid-field")]))
+
+;; TODO: add checks for proper length
+(define (list->hash l)
+  (define (inner ps l)
+    (if (null? l)
+        (alist->hash-table ps #:test eq? #:hash symbol-hash)
+        (inner
+         (append ps (list (cons (->symbol (car l)) (cadr l)))) (drop l 2))))
+  (inner '() l))
+
+(define-syntax define-logger
+  (er-macro-transformer
+   (lambda (exp rename compare)
+     (let* ((level-id (cadr exp))
+            (level-label (string-upcase (symbol->string level-id)))
+            (proc-id (string->symbol
+                      (conc "log-" (symbol->string level-id))))
+            (%define (rename 'define))
+            (%let (rename 'let))
+            (%hash-table-set! (rename 'hash-table-set!))
+            (%json-log (rename '%json-log))
+            (%list->hash (rename 'list->hash)))
+       `(,%define (,proc-id . kvs)
+                  (,%let ((h (,%list->hash kvs)))
+                         (,%hash-table-set! h 'level ,level-label)
+                         (,%json-log '() h)))))))
+
+(define-logger trace)
+(define-logger info)
+(define-logger debug)
+(define-logger warn)
+(define-logger error)
+(define-logger fatal)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Cache filepaths
@@ -77,48 +138,52 @@ SQL
 (define (guard-false v)
   (if (equal? v #f) "" v))
 
-;; If the hash is present, then we update, else insert new row
-(define (persist-photo db row)
+(define (step6-persist-to-db photo)
   (if (not
-       (null? (query fetch (sql db "SELECT hash FROM photos WHERE hash = ?;")
-                     (hash-table-ref/default row 'hash ""))))
-      (update-photo db row)
-      (insert-photo db row)))
+       (null?
+        (query fetch
+               (sql (photo-db photo) "SELECT hash FROM photos WHERE hash = ?;")
+               (photo-sha1 photo))))
+      (update-photo photo)
+      (insert-photo photo)))
 
-(define (insert-photo db row)
-  ;; '(info path target-path filename bytes-copied exif-tags)
-  ;; (png 10 20 0) type w h rot
-  (let* ((tags (hash-table-ref row 'exif-tags))
-         (make (guard-false (cdr (assq 'make tags))))
-         (model (guard-false (cdr (assq 'model tags))))
-         (datetime (cdr (assq 'date-time tags)))
-         (filename (hash-table-ref row 'filename))
-         (info (hash-table-ref row 'info)))
+(define (insert-photo photo)
+  (let* ((tags (photo-exif-tags photo))
+         (make (guard-false (aget 'make tags)))
+         (model (guard-false (aget 'model tags)))
+         (datetime (aget 'date-time tags))
+         (info (photo-info photo))
+         (width (if info (cadr info) 0))
+         (height (if info (caddr info) 0))
+         (type (if info (symbol->string (car info)) "")))
 
-    (exec (sql db "INSERT OR IGNORE INTO photos(hash, filename,
+    (exec (sql (photo-db photo) "INSERT OR IGNORE INTO photos(hash, filename,
 original_path, new_path, filesize, width, height, type, make, model,
 datetime) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")
-          (hash-table-ref row 'hash)
-          filename
-          (hash-table-ref row 'path)
-          (hash-table-ref row 'target-path)
-          (hash-table-ref/default row 'bytes-copied 0)
-          (cadr info)
-          (caddr info)
-          (symbol->string (car info))
+          (photo-sha1 photo)        ; hash
+          (photo-filename photo)    ; filename
+          (photo-input-dir photo)   ; original_path
+          (photo-output-path photo) ; new_path
+          (photo-bytes photo)       ; filesize
+          width
+          height
+          type
           make
           model
-          (get-iso8601-datetime filename datetime))))
+          (photo-date photo))       ; datetime (ISO8601)
+    photo))
 
 ;; If we're copying the same file somewhere, then just update the paths
 ;; The sha1 hash would be the same if the file is unmodified.
-(define (update-photo db row)
-    (exec (sql db "UPDATE photos SET filename = ?, original_path = ?,
+(define (update-photo photo)
+  (exec (sql (photo-db photo)
+             "UPDATE photos SET filename = ?, original_path = ?,
 new_path = ? WHERE hash = ?;")
-          (hash-table-ref row 'filename)
-          (hash-table-ref row 'path)
-          (hash-table-ref row 'target-path)
-          (hash-table-ref row 'hash)))
+        (photo-filename photo)
+        (photo-input-dir photo)
+        (photo-output-path photo)
+        (photo-sha1 photo))
+  photo)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Filesystem Operations
@@ -161,30 +226,49 @@ new_path = ? WHERE hash = ?;")
       (datetime->list dt)
       (datetime->list filename)))
 
-;; Convert "YYYY:MM:DD HH:MM:SS" to '("YYYY" "MM" "DD")
-(define (datetime->list dt)
+;; Convert "YYYY:MM:DD HH:MM:SS" to '("YYYY" "MM" "DD" ...)
+;; for use in ensure-dir
+(define (date-string->list dt)
   (if (not dt)
       (datetime->list "1970:01:01 00:00:00")
       (string-tokenize (car (string-tokenize dt)) char-set:digit)))
 
+;; Convert "YYYY:MM:DD HH:MM:SS" to ISO 8601 string
+(define (exif-datetime->iso8601 dt)
+  (let* ((tokens (string-tokenize dt char-set:digit))
+         (date (take tokens 3))
+         (time (drop tokens 3)))
+    (string-append (string-join date "-") "T" (string-join time ":") ".000Z")))
+
 (define (get-iso8601-datetime filename dt)
   (if (not dt)
       (filename->iso8601 filename)
-      (datetime->iso8601 dt)))
+      (datestring->iso8601 dt)))
 
 ;; Convert "YYYY-MM-DD HH.MM.SS-x-x.jpg" to "YYYY-MM-DD HH:MM:SS.000"
 (define (filename->iso8601 filename)
   (let* ((tokens (string-tokenize filename))
          (date (string-tokenize (car tokens) char-set:digit))
          (time (take (string-tokenize (cadr tokens) char-set:digit) 3)))
-    (string-append (string-join date "-") " " (string-join time ":") ".000")))
+    (string-append (string-join date "-") "T " (string-join time ":") ".000Z")))
 
 ;; 2021:02:13 16:18:41
 ;; Convert "YYYY:MM:DD HH:MM:SS" to "YYYY-MM-DD HH:MM:SS.000"
-(define (datetime->iso8601 dt)
+(define (datestring->iso8601 dt)
   (let* ((tokens (string-tokenize dt))
          (date (string-tokenize (car tokens) char-set:digit)))
     (string-append (string-join date "-") " " (cadr tokens) ".000")))
+
+;; Converts epoch seconss to iso8601
+(define (seconds->iso8601 n)
+  (date->string
+   (seconds->date n #f) "~Y-~m-~dT~H:~M:~S.000Z"))
+
+;; ISO 8601 of the current UTC date/time w nanoseconds
+(define (timestamp)
+  (date->string
+   (current-date (utc-timezone-locale)) "~Y-~m-~dT~H:~M:~S.~N~z"))
+
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Image file handling
@@ -194,9 +278,103 @@ new_path = ? WHERE hash = ?;")
 (define (copy-image path target-path)
   (handle-exceptions exn
       (begin
-	(log-err ((condition-property-accessor 'exn 'message) exn))
+	(log-warn 'proc "copy-image"
+                  'path path
+                  'targetPath target-path
+                  'type "exception"
+                  'msg ((condition-property-accessor 'exn 'message) exn))
         #f)
     (copy-file path target-path)))
+
+(define (aget k a)
+  (if (or (not a) (null? a))
+      #f
+      (let ((v (assq k a)))
+        (if (null? v)
+            #f
+            (cdr v)))))
+
+(define (extract-tags photo)
+  (let ((tags (tag-alist-from-file (photo-filename photo)
+                                   '(model make date-time))))
+    (when tags
+      (photo-exif-tags-set! photo tags))
+    photo))
+
+;; image-info will throw unexpected EOF errors which we need to handle
+(define (get-image-info photo)
+  (handle-exceptions
+      exn
+      (begin
+        (log-warn 'msg
+                  (format "Couldn't get image-info for ~A ~A"
+                          (photo-filename photo)
+                          ((condition-property-accessor 'exn 'message) exn)))
+        photo)
+    (let ((info (call-with-input-file (photo-filename photo) image-info)))
+      (when info
+        (photo-info-set! photo info))
+      photo)))
+
+;; file-modification-time will also throw if it can't find the file, which we
+;; should have caught already, so let it bubble up
+(define (get-image-mtime photo)
+  (let ((mtime (file-modification-time (photo-filename photo))))
+      (when mtime
+        (photo-mtime-set! photo mtime))
+      photo))
+
+(define (step2-get-metadata photo)
+  (get-image-mtime (get-image-info (extract-tags photo))))
+
+(define re-filename-date
+  (sre->irregex
+   '(seq (= 4 numeric) "-" (= 2 numeric) "-" (= 2 numeric) space
+         (= 2 numeric) (or "." ":") (= 2 numeric) (or "." ":") (= 2 numeric)
+         "." (or "jpg" "jpeg"))))
+
+;; Inspect the file to determine the best possible date
+(define (step3-get-filedate photo)
+  (let ((og-filename (pathname-strip-directory (photo-filename photo)))
+        (date-time (aget 'date-time (photo-exif-tags photo)))
+        (mtime (photo-mtime photo)))
+
+    ;; Now we need to work our way through the following:
+    ;; - if DT then make an ISO8601 filename
+    ;; - else if we can parse a date from filename, use that
+    ;; - else convert mtime seconds to ISO8601 filename
+    (define filedate
+      (cond [date-time (exif-datetime->iso8601 date-time)]
+            [(irregex-match re-filename-date og-filename)
+             (filename->iso8601 og-filename)]
+            [mtime (seconds->iso8601 mtime)]
+            [else "1970-01-01T00:00:00.000Z"]))
+    (photo-date-set! photo filedate)
+    photo))
+
+(define (step4-copy-photo photo)
+  (let* ((og-filename (pathname-strip-directory (photo-filename photo)))
+         (target-dir
+          (ensure-dir
+           (photo-output-dir photo) (date-string->list (photo-date photo))))
+         (target-path (normalize-pathname
+                       (string-append target-dir "/" og-filename)))
+         (bytes-copied (copy-image (photo-filename photo) target-path)))
+    (photo-output-path-set! photo target-path)
+    (if bytes-copied
+        (begin
+          (photo-bytes-set! photo bytes-copied)
+          photo)
+        (log-error-and-false "step4-copy-photo"
+                             (format "Couldn't copy ~A" target-path)))))
+
+
+;; Calculate the SHA1 of the copied image file. We use this as a unique
+;; id in the SQLite DB
+(define (step5-get-hash photo)
+  (let ((sha (sha1sum (photo-output-path photo))))
+    (photo-sha1-set! photo sha)
+    photo))
 
 ;; Get a SHA1 hash of the copied file and insert metadata into DB
 (define (create-entry db opts)
@@ -204,6 +382,91 @@ new_path = ? WHERE hash = ?;")
     (hash-table-set! opts 'hash sha)
     (persist-photo db opts)))
 
+
+;; We're only interested in certain types of files
+;; primarily JPGs Maybe mp4 / mov?
+(define (is-jpeg? path)
+  (let ((ext (pathname-extension path)))
+    (if (and ext
+             (or (string= ext "jpg")
+                 (string= ext "jpeg")))
+        #t
+        #f)))
+
+(define (step1-check-file-path p)
+  (let ((f (photo-filename p)))
+    (if (and f (file-exists? f))
+        p
+        (log-error-and-false "step1-check-file-path"
+                             (format "~A is not a valid file" f)))))
+
+(define (log-error-and-false proc msg)
+  (log-error 'proc proc
+             'msg msg)
+  #f)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Structs
+
+(defstruct photo
+  db filename input-dir output-dir output-path exif-tags info mtime date bytes
+  sha1)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Processing Pipeline
+
+(define verbose? #f)
+
+;; Creates a handler function with db in out bound to the returned closure.
+;; This is specifically to be passed to the find-files #:action argument
+;; which passes in a path string (path) and a previous value (prev).
+;; The closure creates a photo? record and hands off to process-photo pipeline.
+(define ((handle-photo db in out) path prev)
+  (process-photo
+   (make-photo db: db
+               input-dir: in
+               output-dir: out
+               filename: path)))
+
+;; Guard functions passed to and->
+;; Ensures first value input to fn is pred? or returns #f
+;; Handles exception by logging a warning and returns #f
+(define-syntax guard/and->
+  (syntax-rules ()
+    ((_ val pred? fn args ...)
+     (handle-exceptions exn
+         (begin
+	   (log-warn 'type "exception"
+                     'guardedProc (format "~A" fn)
+                     'value (format "~A" val)
+                     'proc "guard/and->"
+                     'msg ((condition-property-accessor 'exn 'message) exn))
+           #f)
+         (if (pred? val)
+             (apply fn (append (list val) (list args ...)))
+             #f)))))
+
+;; Passes photo? through an and-> pipeline of guarded functions
+(define (process-photo photo)
+  (when verbose?
+    (log-debug 'proc "process-photo"
+               'msg (format "received ~A" photo)))
+  (let ((result (and-> photo
+                       (guard/and-> photo? step1-check-file-path)
+                       (guard/and-> photo? step2-get-metadata)
+                       (guard/and-> photo? step3-get-filedate)
+                       (guard/and-> photo? step4-copy-photo)
+                       (guard/and-> photo? step5-get-hash)
+                       (guard/and-> photo? step6-persist-to-db))))
+    (unless result
+      (log-warn 'proc "process-photo"
+                'msg (format "Couldn't process ~A" (photo-filename photo))))))
+
+;; Accepts two command line args:
+;;
+;; input-dir - directory to scan for files
+;; output-dir - directory to copy new file structure to
+;;
 ;; Pulls EXIF data from image and if present attempts to copy to a
 ;; directory tree in the target-dir shaped like:
 ;;
@@ -216,54 +479,6 @@ new_path = ? WHERE hash = ?;")
 ;;
 ;; If the file can't be copied send a message to stderr.
 ;;
-(define (process-image db path out)
-  (let ((tags (tag-alist-from-file path '(model make date-time))))
-    (if tags
-        (let* ((filename (pathname-strip-directory path))
-               (info (call-with-input-file path image-info))
-               (date (get-datetime filename (cdr (assq 'date-time tags))))
-               (dir (ensure-dir out date))
-               (target-path (normalize-pathname
-                             (string-append dir "/" filename)))
-               (exif-tags tags)
-               (bytes-copied (copy-image path target-path))
-               (opts (make-hash-table)))
-
-          (hash-table-set! opts 'path path)
-          (hash-table-set! opts 'target-path target-path)
-          (hash-table-set! opts 'filename filename)
-          (hash-table-set! opts 'bytes-copied bytes-copied)
-          (hash-table-set! opts 'exif-tags tags)
-          (hash-table-set! opts 'info info)
-
-          (if bytes-copied              
-              (create-entry db opts)
-              (log-err "couldn't copy ~A" filename)))
-        (log-err "no exif for ~A" path)))
-    #t)
-
-(define ((process-dir db in out) path prev)
-  (if (file-exists? path)
-      (process-image db path out)
-      (begin
-        (log-err "file doesn't exist: ~A" path)
-        #f)))
-
-;; We're only interested in certain types of files
-;; primarily JPGs Maybe mp4 / mov?
-(define (is-jpeg? path)
-  (let ((ext (pathname-extension path)))
-    (if (and ext
-             (or (string= ext "jpg")
-                 (string= ext "jpeg")))
-        #t
-        #f)))
-
-;; Accepts two command line args:
-;;
-;; input-dir - directory to scan for files
-;; output-dir - directory to copy new file structure to
-;;
 (define (main args)
   (define-values
       (input-dir output-dir)
@@ -275,11 +490,12 @@ new_path = ? WHERE hash = ?;")
       (begin
         (ensure-cache-dir)
         (ensure-db)
-        (let ((db (get-db-handle)))
+        (let* ((db (get-db-handle))
+               (handler (handle-photo db input-dir output-dir)))
           (find-files input-dir
                       #:test is-jpeg?
-                      #:action (process-dir db input-dir output-dir))
+                      #:action handler)
           (close-database db)))
-      (log-err "input: ~A output: ~A" input-dir output-dir)))
+      (log-error 'msg (format "input: ~A output: ~A" input-dir output-dir))))
 
 
