@@ -278,16 +278,30 @@ new_path = ? WHERE hash = ?;")
 ;; Image file handling
 
 ;; Wraps copy-file with an exception handler to cover an already
-;; existing file (we don't clobber)
+;; existing file (we don't clobber). If the file exists at target-path
+;; then we log a warning and return the file-size of image at
+;; target-path. We do this so we can update any existing records in
+;; the DB based on the sha1 of the file.
+;;
+;; If file-size throws an exception then we log that
+;; warning and return #f, which will short circuit the pipeline.
 (define (copy-image path target-path)
   (handle-exceptions exn
-      (begin
-	(log-warn 'proc "copy-image"
-                  'path path
-                  'targetPath target-path
-                  'type "exception"
-                  'msg ((condition-property-accessor 'exn 'message) exn))
-        #f)
+      (let ((msg ((condition-property-accessor 'exn 'message) exn)))
+        (if (equal? "newfile exists but clobber is false" msg)
+            (begin
+	      (log-warn 'proc "copy-image"
+                        'path path
+                        'targetPath target-path
+                        'type "exception"
+                        'msg msg)
+              (file-size target-path))
+            (begin (log-warn 'proc "file-size"
+                        'path path
+                        'targetPath target-path
+                        'type "exception"
+                        'msg msg)
+                   #f)))
     (copy-file path target-path)))
 
 (define (aget k a)
