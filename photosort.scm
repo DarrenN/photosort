@@ -305,7 +305,8 @@ new_path = ? WHERE hash = ?;")
   (handle-exceptions
       exn
       (begin
-        (log-warn 'msg
+        (log-warn 'proc "get-image-info"
+                  'msg
                   (format "Couldn't get image-info for ~A ~A"
                           (photo-filename photo)
                           ((condition-property-accessor 'exn 'message) exn)))
@@ -374,13 +375,6 @@ new_path = ? WHERE hash = ?;")
   (let ((sha (sha1sum (photo-output-path photo))))
     (photo-sha1-set! photo sha)
     photo))
-
-;; Get a SHA1 hash of the copied file and insert metadata into DB
-(define (create-entry db opts)
-  (let ((sha (sha1sum (hash-table-ref opts 'target-path))))
-    (hash-table-set! opts 'hash sha)
-    (persist-photo db opts)))
-
 
 ;; We're only interested in certain types of files
 ;; primarily JPGs Maybe mp4 / mov?
