@@ -37,6 +37,11 @@
 ;; 7. Add row in sqlite DB with: sha, filename, new path, datetime,
 ;;    width, height, type
 
+(cond-expand
+  (compiling
+   (define (compiled?) #t))
+  (else
+   (define (compiled?) #f)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Logging
@@ -476,8 +481,8 @@ new_path = ? WHERE hash = ?;")
   (define-values
       (input-dir output-dir)
       (values
-       (car (command-line-arguments))
-       (cadr (command-line-arguments))))
+       (car args)
+       (cadr args)))
   (if (and (directory-exists? input-dir)
            (directory-exists? output-dir))
       (begin
@@ -491,4 +496,6 @@ new_path = ? WHERE hash = ?;")
           (close-database db)))
       (log-error 'msg (format "input: ~A output: ~A" input-dir output-dir))))
 
-
+;; We need to explicitly call main when this has been compiled
+(when (compiled?)
+  (main (command-line-arguments)))
