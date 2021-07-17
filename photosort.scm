@@ -315,9 +315,9 @@ new_path = ? WHERE hash = ?;")
 (define (extract-tags photo)
   (let ((tags (tag-alist-from-file (photo-filename photo)
                                    '(model make date-time))))
-    (when tags
-      (photo-exif-tags-set! photo tags))
-    photo))
+    (if tags
+        (update-photo photo exif-tags: tags)
+        photo)))
 
 ;; image-info will throw unexpected EOF errors which we need to handle
 (define (get-image-info photo)
@@ -331,17 +331,17 @@ new_path = ? WHERE hash = ?;")
                           ((condition-property-accessor 'exn 'message) exn)))
         photo)
     (let ((info (call-with-input-file (photo-filename photo) image-info)))
-      (when info
-        (photo-info-set! photo info))
-      photo)))
+      (if info
+          (update-photo photo info: info)
+          photo))))
 
 ;; file-modification-time will also throw if it can't find the file, which we
 ;; should have caught already, so let it bubble up
 (define (get-image-mtime photo)
   (let ((mtime (file-modification-time (photo-filename photo))))
-      (when mtime
-        (photo-mtime-set! photo mtime))
-      photo))
+      (if mtime
+          (update-photo photo mtime: mtime)
+          photo)))
 
 (define (step2-get-metadata photo)
   (get-image-mtime (get-image-info (extract-tags photo))))
@@ -368,8 +368,7 @@ new_path = ? WHERE hash = ?;")
              (filename->iso8601 og-filename)]
             [mtime (seconds->iso8601 mtime)]
             [else "1970-01-01T00:00:00.000Z"]))
-    (photo-date-set! photo filedate)
-    photo))
+    (update-photo photo date: filedate)))
 
 (define (step4-copy-photo photo)
   (let* ((og-filename (pathname-strip-directory (photo-filename photo)))
@@ -378,12 +377,10 @@ new_path = ? WHERE hash = ?;")
            (photo-output-dir photo) (date-string->list (photo-date photo))))
          (target-path (normalize-pathname
                        (string-append target-dir "/" og-filename)))
-         (bytes-copied (copy-image (photo-filename photo) target-path)))
-    (photo-output-path-set! photo target-path)
+         (bytes-copied (copy-image (photo-filename photo) target-path))
+         (updated-photo (update-photo photo output-path: target-path)))
     (if bytes-copied
-        (begin
-          (photo-bytes-set! photo bytes-copied)
-          photo)
+        (update-photo updated-photo bytes: bytes-copied)
         (log-error-and-false "step4-copy-photo"
                              (format "Couldn't copy ~A" target-path)))))
 
@@ -392,8 +389,7 @@ new_path = ? WHERE hash = ?;")
 ;; id in the SQLite DB
 (define (step5-get-hash photo)
   (let ((sha (sha1sum (photo-output-path photo))))
-    (photo-sha1-set! photo sha)
-    photo))
+    (update-photo photo sha1: sha)))
 
 ;; We're only interested in certain types of files
 ;; primarily JPGs Maybe mp4 / mov?
