@@ -142,6 +142,12 @@ SQL
 (define (guard-false v)
   (if (equal? v #f) "" v))
 
+;; datetime should be in the iso8601 utc form 2021-07-24T00:15:53.000Z
+(define (get-last-processed-datetime db)
+  (define dt
+    (query fetch (sql db "SELECT datetime FROM photos ORDER BY datetime DESC LIMIT 1")))
+  (if (null? dt) 0 (iso8601->seconds (car dt))))
+
 (define (step6-persist-to-db photo)
   (if (not
        (null?
@@ -225,16 +231,11 @@ new_path = ? WHERE hash = ?;")
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Datetime utils
 
-(define (get-datetime filename dt)
-  (if dt
-      (datetime->list dt)
-      (datetime->list filename)))
-
 ;; Convert "YYYY:MM:DD HH:MM:SS" to '("YYYY" "MM" "DD" ...)
 ;; for use in ensure-dir
 (define (date-string->list dt)
   (if (not dt)
-      (datetime->list "1970:01:01 00:00:00")
+      (list "1970" "01" "01" "00" "00" "00")
       (string-tokenize (car (string-tokenize dt)) char-set:digit)))
 
 ;; Convert "YYYY:MM:DD HH:MM:SS" to ISO 8601 string
@@ -267,6 +268,11 @@ new_path = ? WHERE hash = ?;")
 (define (seconds->iso8601 n)
   (date->string
    (seconds->date n #f) "~Y-~m-~dT~H:~M:~S.000Z"))
+
+(define ISO8601-TEMPLATE "~Y-~m-~dT~H:~M:~S.000Z")
+
+(define (iso8601->seconds s)
+  (date->seconds (string->date s ISO8601-TEMPLATE)))
 
 ;; ISO 8601 of the current UTC date/time w nanoseconds
 (define (timestamp)
@@ -436,6 +442,13 @@ new_path = ? WHERE hash = ?;")
                output-dir: out
                filename: path)))
 
+;; We only want to process valid jpegs that have been added since the last time
+;; we processed files. 
+(define ((test-photo last-processed) path)
+  (if (is-jpeg? path)
+      (>= (file-modification-time path) last-processed)
+      #f))
+
 ;; Guard functions passed to and->
 ;; Ensures first value input to fn is pred? or returns #f
 ;; Handles exception by logging a warning and returns #f
@@ -499,9 +512,11 @@ new_path = ? WHERE hash = ?;")
         (ensure-cache-dir)
         (ensure-db)
         (let* ((db (get-db-handle))
+               (valid-photo?
+                (test-photo (get-last-processed-datetime db)))
                (handler (handle-photo db input-dir output-dir)))
           (find-files input-dir
-                      #:test is-jpeg?
+                      #:test valid-photo?
                       #:action handler)
           (close-database db)))
       (log-error 'msg (format "input: ~A output: ~A" input-dir output-dir))))
